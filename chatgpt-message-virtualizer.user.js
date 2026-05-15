@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Message Virtualizer
 // @namespace    local.chatgpt.virtualizer
-// @version      0.2.0
+// @version      0.3.0
 // @description  Detach far-off ChatGPT conversation turns and replace them with height placeholders.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -12,25 +12,12 @@
 (() => {
   "use strict";
 
-  const CONFIG = {
-    // ChatGPT currently tends to use this shape for conversation turns.
-    // Adjust this selector if the frontend changes.
+  const DEFAULT_CONFIG = {
     turnSelector: '[data-testid^="conversation-turn-"]',
-
-    // Keep this many newest turns mounted no matter where they are.
     keepLast: 10,
-
-    // Mount anything within this many pixels above/below the viewport.
     overscanPx: 5000,
-
-    // Minimum placeholder height if measurement fails.
     fallbackHeightPx: 160,
-
-    // Throttle-ish delay for rescans.
     rescanDelayMs: 250,
-
-    // Conservative selectors for streaming / generating / stop UI.
-    // These are intentionally broad and may need adjustment as ChatGPT changes.
     activeGenerationSelectors: [
       '[aria-busy="true"]',
       '[data-testid*="stop"]',
@@ -43,9 +30,12 @@
       '[aria-label*="Loading"]',
       '[aria-label*="loading"]',
     ],
-
-    // Debug logs.
     debug: false,
+  };
+
+  const CONFIG = {
+    ...DEFAULT_CONFIG,
+    ...(window.cgptVirtualizerConfig || {}),
   };
 
   let enabled = true;
@@ -133,6 +123,35 @@
     return Math.max(CONFIG.fallbackHeightPx, Math.ceil(h));
   }
 
+  function isVirtualizerElement(node) {
+    if (!(node instanceof Element)) return false;
+
+    return (
+      node.classList?.contains("cgpt-vmsg-placeholder") ||
+      Boolean(node.querySelector?.(".cgpt-vmsg-placeholder"))
+    );
+  }
+
+  const visibilityObserver = new IntersectionObserver(
+    (records) => {
+      for (const record of records) {
+        const entry =
+          entriesByNode.get(record.target) ||
+          entriesByPlaceholder.get(record.target);
+
+        if (!entry) continue;
+        entry.nearViewport = record.isIntersecting;
+      }
+
+      scheduleReconcile();
+    },
+    {
+      root: null,
+      rootMargin: `${CONFIG.overscanPx}px 0px`,
+      threshold: 0,
+    }
+  );
+
   function createEntry(node) {
     const id = String(nextId++);
     const placeholder = document.createElement("div");
@@ -148,11 +167,13 @@
       mounted: true,
       height: CONFIG.fallbackHeightPx,
       lastSeenIndex: 0,
+      nearViewport: null,
     };
 
     entriesById.set(id, entry);
     entriesByNode.set(node, entry);
     entriesByPlaceholder.set(placeholder, entry);
+    visibilityObserver.observe(node);
 
     return entry;
   }
@@ -171,13 +192,31 @@
     }
   }
 
+  function cleanupDisconnectedEntries() {
+    for (const [id, entry] of entriesById) {
+      const nodeConnected = entry.node?.isConnected;
+      const placeholderConnected = entry.placeholder?.isConnected;
+
+      if (!nodeConnected && !placeholderConnected) {
+        visibilityObserver.unobserve(entry.node);
+        visibilityObserver.unobserve(entry.placeholder);
+        entriesById.delete(id);
+        log("forgot disconnected entry", id);
+      }
+    }
+  }
+
   function orderedEntriesInDocument() {
     const selector = `${CONFIG.turnSelector}, .cgpt-vmsg-placeholder`;
     const ordered = [];
+    const seen = new Set();
 
     for (const el of document.querySelectorAll(selector)) {
       const entry = entriesByNode.get(el) || entriesByPlaceholder.get(el);
-      if (entry) ordered.push(entry);
+      if (!entry || seen.has(entry.id)) continue;
+
+      seen.add(entry.id);
+      ordered.push(entry);
     }
 
     ordered.forEach((entry, index) => {
@@ -190,15 +229,13 @@
   function shouldMount(entry, orderedLength) {
     const newestCutoff = Math.max(0, orderedLength - CONFIG.keepLast);
 
-    // Always keep the newest N turns mounted, even if scrolled far away.
-    // This protects the active generation placeholder / streaming response tail.
     if (entry.lastSeenIndex >= newestCutoff) return true;
-
-    // Never virtualize a mounted node that appears to contain active generation UI.
     if (entry.mounted && nodeLooksActiveOrGenerating(entry.node)) return true;
 
     const anchor = entry.mounted ? entry.node : entry.placeholder;
     if (!anchor || !anchor.isConnected) return true;
+
+    if (typeof entry.nearViewport === "boolean") return entry.nearViewport;
 
     const rect = anchor.getBoundingClientRect();
     const viewportHeight =
@@ -216,23 +253,32 @@
 
     if (node.contains(document.activeElement)) return false;
     if (isNodeInSelection(node)) return false;
-
-    // Never detach a turn containing active / streaming / generating UI.
     if (nodeLooksActiveOrGenerating(node)) return false;
 
-    // While any generation is active anywhere, be extra conservative around
-    // the newest retained region. This matters when scrolling to the top
-    // during response generation.
     if (hasActiveGeneration()) {
       const ordered = orderedEntriesInDocument();
       const newestCutoff = Math.max(0, ordered.length - CONFIG.keepLast);
 
-      if (entry.lastSeenIndex >= newestCutoff) {
-        return false;
-      }
+      if (entry.lastSeenIndex >= newestCutoff) return false;
     }
 
     return true;
+  }
+
+  function preserveScrollWhileReplacing(anchor, getReplacement, replace) {
+    const beforeRect = anchor.getBoundingClientRect();
+    const wasAboveViewport = beforeRect.bottom < 0;
+
+    replace();
+
+    if (!wasAboveViewport) return;
+
+    const replacement = getReplacement();
+    const afterHeight =
+      replacement?.getBoundingClientRect?.().height ?? beforeRect.height;
+    const delta = afterHeight - beforeRect.height;
+
+    if (delta !== 0) window.scrollBy(0, delta);
   }
 
   function mount(entry) {
@@ -241,8 +287,13 @@
     const ph = entry.placeholder;
     if (!ph.isConnected || !ph.parentNode) return;
 
-    ph.replaceWith(entry.node);
-    entry.mounted = true;
+    preserveScrollWhileReplacing(ph, () => entry.node, () => {
+      ph.replaceWith(entry.node);
+      visibilityObserver.unobserve(ph);
+      visibilityObserver.observe(entry.node);
+      entry.mounted = true;
+      entry.nearViewport = true;
+    });
 
     log("mounted", entry.id);
   }
@@ -257,10 +308,14 @@
     entry.height = measureHeight(node);
     entry.placeholder.style.height = `${entry.height}px`;
 
-    node.parentNode.insertBefore(entry.placeholder, node);
-    node.remove();
-
-    entry.mounted = false;
+    preserveScrollWhileReplacing(node, () => entry.placeholder, () => {
+      node.parentNode.insertBefore(entry.placeholder, node);
+      node.remove();
+      visibilityObserver.unobserve(node);
+      visibilityObserver.observe(entry.placeholder);
+      entry.mounted = false;
+      entry.nearViewport = false;
+    });
 
     log("unmounted", entry.id, entry.height);
   }
@@ -270,6 +325,7 @@
 
     if (!enabled) return;
 
+    cleanupDisconnectedEntries();
     collectMountedTurns();
 
     const ordered = orderedEntriesInDocument();
@@ -296,9 +352,7 @@
   }
 
   function hydrateAll() {
-    for (const entry of entriesById.values()) {
-      mount(entry);
-    }
+    for (const entry of entriesById.values()) mount(entry);
   }
 
   function toggleEnabled() {
@@ -313,7 +367,42 @@
     }
   }
 
-  // Kill switch: Alt+Shift+V
+  function mutationMayContainTurns(mutation) {
+    const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
+
+    return nodes.some((node) => {
+      if (!(node instanceof Element)) return false;
+      if (isVirtualizerElement(node)) return false;
+      if (entriesByNode.has(node) || entriesByPlaceholder.has(node)) return false;
+
+      return (
+        node.matches?.(CONFIG.turnSelector) ||
+        Boolean(node.querySelector?.(CONFIG.turnSelector))
+      );
+    });
+  }
+
+  window.cgptVirtualizer = {
+    get enabled() {
+      return enabled;
+    },
+    get config() {
+      return { ...CONFIG };
+    },
+    toggle: toggleEnabled,
+    hydrateAll,
+    stats() {
+      const entries = [...entriesById.values()];
+
+      return {
+        total: entries.length,
+        mounted: entries.filter((entry) => entry.mounted).length,
+        virtualized: entries.filter((entry) => !entry.mounted).length,
+        activeGeneration: hasActiveGeneration(),
+      };
+    },
+  };
+
   window.addEventListener("keydown", (event) => {
     if (event.altKey && event.shiftKey && event.code === "KeyV") {
       toggleEnabled();
@@ -323,8 +412,8 @@
   window.addEventListener("scroll", scheduleReconcile, { passive: true });
   window.addEventListener("resize", scheduleReconcile, { passive: true });
 
-  const observer = new MutationObserver(() => {
-    scheduleRescan();
+  const observer = new MutationObserver((mutations) => {
+    if (mutations.some(mutationMayContainTurns)) scheduleRescan();
   });
 
   observer.observe(document.documentElement, {
