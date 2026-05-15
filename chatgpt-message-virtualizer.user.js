@@ -42,6 +42,7 @@
   let nextId = 1;
   let scheduled = false;
   let rescanTimer = null;
+  let internalMutationDepth = 0;
 
   const entriesById = new Map();
   const entriesByNode = new WeakMap();
@@ -265,6 +266,15 @@
     return true;
   }
 
+  function withInternalMutation(fn) {
+    internalMutationDepth++;
+    try {
+      fn();
+    } finally {
+      internalMutationDepth--;
+    }
+  }
+
   function preserveScrollWhileReplacing(anchor, getReplacement, replace) {
     const beforeRect = anchor.getBoundingClientRect();
     const wasAboveViewport = beforeRect.bottom < 0;
@@ -288,11 +298,13 @@
     if (!ph.isConnected || !ph.parentNode) return;
 
     preserveScrollWhileReplacing(ph, () => entry.node, () => {
-      ph.replaceWith(entry.node);
+      withInternalMutation(() => {
+        ph.replaceWith(entry.node);
+      });
       visibilityObserver.unobserve(ph);
       visibilityObserver.observe(entry.node);
       entry.mounted = true;
-      entry.nearViewport = true;
+      entry.nearViewport = null;
     });
 
     log("mounted", entry.id);
@@ -309,12 +321,14 @@
     entry.placeholder.style.height = `${entry.height}px`;
 
     preserveScrollWhileReplacing(node, () => entry.placeholder, () => {
-      node.parentNode.insertBefore(entry.placeholder, node);
-      node.remove();
+      withInternalMutation(() => {
+        node.parentNode.insertBefore(entry.placeholder, node);
+        node.remove();
+      });
       visibilityObserver.unobserve(node);
       visibilityObserver.observe(entry.placeholder);
       entry.mounted = false;
-      entry.nearViewport = false;
+      entry.nearViewport = null;
     });
 
     log("unmounted", entry.id, entry.height);
@@ -368,12 +382,13 @@
   }
 
   function mutationMayContainTurns(mutation) {
+    if (internalMutationDepth > 0) return false;
+
     const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
 
     return nodes.some((node) => {
       if (!(node instanceof Element)) return false;
       if (isVirtualizerElement(node)) return false;
-      if (entriesByNode.has(node) || entriesByPlaceholder.has(node)) return false;
 
       return (
         node.matches?.(CONFIG.turnSelector) ||
@@ -387,7 +402,10 @@
       return enabled;
     },
     get config() {
-      return { ...CONFIG };
+      return {
+        ...CONFIG,
+        activeGenerationSelectors: [...CONFIG.activeGenerationSelectors],
+      };
     },
     toggle: toggleEnabled,
     hydrateAll,
