@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Stream Buffer
 // @namespace    local.chatgpt.stream-buffer
-// @version      0.2.0
+// @version      0.2.1
 // @description  Buffers ChatGPT streaming fetch responses and delivers them to the app only when complete, reducing token-by-token render churn.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -100,7 +100,7 @@
     badge.style.cssText = [
       "position:fixed",
       "right:12px",
-      "top:12px",
+      "top:64px",
       "z-index:2147483647",
       "font:12px system-ui,sans-serif",
       "padding:6px 8px",
