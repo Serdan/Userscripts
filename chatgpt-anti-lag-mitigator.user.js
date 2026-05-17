@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Anti-Lag Mitigator
 // @namespace    local.chatgpt.antilag
-// @version      0.1.0
+// @version      0.1.1
 // @description  Reduces rendering cost in long ChatGPT/custom GPT conversations by containing and freezing older UI blocks.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -14,18 +14,55 @@
 
   const CONFIG = {
     keepLastBlocks: 8,
-    scanIntervalMs: 8000,
+    scanIntervalMs: 12000,
+    typingCooldownMs: 3500,
     destructiveFreeze: false,
     destructiveKeepLast: 6,
+    disableAnimations: false,
     debug: false,
   };
 
   const STYLE_ID = "cgpt-antilag-style";
   let lastRun = 0;
+  let lastUserInputAt = 0;
 
   const log = (...args) => {
     if (CONFIG.debug) console.log("[cgpt-antilag]", ...args);
   };
+
+  function markUserInput() {
+    lastUserInputAt = performance.now();
+  }
+
+  window.addEventListener("keydown", markUserInput, true);
+  window.addEventListener("beforeinput", markUserInput, true);
+  window.addEventListener("input", markUserInput, true);
+  window.addEventListener("compositionstart", markUserInput, true);
+  window.addEventListener("compositionend", markUserInput, true);
+
+  function isEditableElement(el) {
+    if (!(el instanceof HTMLElement)) return false;
+
+    return Boolean(
+      el.closest(
+        [
+          "textarea",
+          "input",
+          "[contenteditable='true']",
+          "[role='textbox']",
+          "form",
+          "[data-testid*='composer']",
+          "[data-testid*='prompt']",
+          "[data-testid*='input']",
+        ].join(",")
+      )
+    );
+  }
+
+  function isUserTypingRecently() {
+    if (!isEditableElement(document.activeElement)) return false;
+    return performance.now() - lastUserInputAt < CONFIG.typingCooldownMs;
+  }
 
   function injectCSS() {
     if (document.getElementById(STYLE_ID)) return;
@@ -33,17 +70,16 @@
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-      *, *::before, *::after {
+      ${CONFIG.disableAnimations ? `
+      .cgpt-antilag-old,
+      .cgpt-antilag-old *,
+      .cgpt-antilag-frozen,
+      .cgpt-antilag-frozen * {
         animation-duration: 0.001s !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.001s !important;
-        scroll-behavior: auto !important;
       }
-
-      main *, [role="main"] * {
-        content-visibility: auto;
-        contain-intrinsic-size: auto 160px;
-      }
+      ` : ""}
 
       .cgpt-antilag-old {
         content-visibility: auto !important;
@@ -135,6 +171,16 @@
     return score;
   }
 
+  function isBadCandidate(el) {
+    if (!(el instanceof HTMLElement)) return true;
+    if (el === document.body || el === document.documentElement) return true;
+    if (el.matches("main, [role='main']") || el.querySelector("main")) return true;
+    if (isEditableElement(el)) return true;
+    if (el.contains(document.activeElement) && isEditableElement(document.activeElement)) return true;
+
+    return false;
+  }
+
   function findLikelyBlocks() {
     const selectors = [
       "article",
@@ -159,11 +205,9 @@
       }
 
       for (const el of nodes) {
-        if (!(el instanceof HTMLElement)) continue;
         if (seen.has(el)) continue;
         seen.add(el);
-        if (el === document.body || el === document.documentElement) continue;
-        if (el.matches("main, [role='main']") || el.querySelector("main")) continue;
+        if (isBadCandidate(el)) continue;
         if (!visibleEnough(el)) continue;
 
         const score = scoreCandidate(el);
@@ -194,6 +238,7 @@
 
     for (const el of oldBlocks) {
       if (el.dataset.cgptFrozen === "1") continue;
+      if (isBadCandidate(el)) continue;
       el.classList.add("cgpt-antilag-old");
 
       const textLen = safeTextLength(el);
@@ -213,6 +258,7 @@
 
     for (const el of oldBlocks) {
       if (el.dataset.cgptFrozen === "1") continue;
+      if (isBadCandidate(el)) continue;
       if (el.contains(document.activeElement)) continue;
 
       const summary = (el.textContent || "").replace(/\s+/g, " ").slice(0, 240);
@@ -255,9 +301,14 @@
   function applyMitigation() {
     const now = performance.now();
     if (now - lastRun < 1000) return;
-    lastRun = now;
+    if (isUserTypingRecently()) {
+      log("skip while typing");
+      return;
+    }
 
+    lastRun = now;
     injectCSS();
+
     const blocks = findLikelyBlocks();
     const collapsed = collapseOldBlocks(blocks);
     const frozen = CONFIG.destructiveFreeze ? destructiveFreezeOldBlocks(blocks) : 0;
