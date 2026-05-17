@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Render Gate
 // @namespace    local.chatgpt.render-gate
-// @version      0.1.0
-// @description  Aggressively hides ChatGPT transcript/tool UI while a response is generating to reduce layout and paint stalls.
+// @version      0.2.0
+// @description  Reduces ChatGPT streaming render pressure by temporarily blanking older transcript/tool UI while preserving layout.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-idle
@@ -15,7 +15,8 @@
   const CONFIG = {
     pollMs: 500,
     releaseDelayMs: 1200,
-    mode: "hide", // "hide" or "contain"
+    keepNewest: 2,
+    mode: "blank", // "blank" or "dim"
     debug: false,
   };
 
@@ -23,6 +24,7 @@
   let gated = false;
   let releaseTimer = null;
   let lastCandidateCount = 0;
+  let lastGatedCount = 0;
 
   const log = (...args) => {
     if (CONFIG.debug) console.log("[cgpt-render-gate]", ...args);
@@ -34,18 +36,18 @@
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-      .cgpt-render-gated-hidden {
-        display: none !important;
+      .cgpt-render-gated-blank {
+        visibility: hidden !important;
+        pointer-events: none !important;
+        user-select: none !important;
+        contain: paint style !important;
       }
 
-      .cgpt-render-gated-contained {
-        visibility: hidden !important;
-        content-visibility: hidden !important;
-        contain: strict !important;
-        contain-intrinsic-size: auto 1px !important;
-        max-height: 1px !important;
-        overflow: hidden !important;
+      .cgpt-render-gated-dim {
+        opacity: 0.08 !important;
         pointer-events: none !important;
+        user-select: none !important;
+        contain: paint style !important;
       }
 
       #cgpt-render-gate-indicator {
@@ -203,11 +205,19 @@
       indicator.id = "cgpt-render-gate-indicator";
       document.documentElement.appendChild(indicator);
     }
-    indicator.textContent = `Render gated while response generates (${lastCandidateCount} blocks hidden). Alt+Shift+G toggles.`;
+    indicator.textContent = `Render gate: ${lastGatedCount}/${lastCandidateCount} older blocks blanked; newest ${CONFIG.keepNewest} kept visible. Alt+Shift+G toggles.`;
   }
 
   function removeIndicator() {
     document.getElementById("cgpt-render-gate-indicator")?.remove();
+  }
+
+  function clearGateClasses() {
+    document
+      .querySelectorAll(".cgpt-render-gated-blank, .cgpt-render-gated-dim")
+      .forEach((el) => {
+        el.classList.remove("cgpt-render-gated-blank", "cgpt-render-gated-dim");
+      });
   }
 
   function applyGate() {
@@ -216,27 +226,32 @@
 
     const candidates = findGateCandidates();
     lastCandidateCount = candidates.length;
-    const cls = CONFIG.mode === "contain" ? "cgpt-render-gated-contained" : "cgpt-render-gated-hidden";
-    const otherCls = CONFIG.mode === "contain" ? "cgpt-render-gated-hidden" : "cgpt-render-gated-contained";
 
-    for (const el of candidates) {
+    const toGate = candidates.slice(0, Math.max(0, candidates.length - CONFIG.keepNewest));
+    const toKeep = candidates.slice(Math.max(0, candidates.length - CONFIG.keepNewest));
+    lastGatedCount = toGate.length;
+
+    const cls = CONFIG.mode === "dim" ? "cgpt-render-gated-dim" : "cgpt-render-gated-blank";
+    const otherCls = CONFIG.mode === "dim" ? "cgpt-render-gated-blank" : "cgpt-render-gated-dim";
+
+    for (const el of toKeep) {
+      el.classList.remove("cgpt-render-gated-blank", "cgpt-render-gated-dim");
+    }
+
+    for (const el of toGate) {
       el.classList.remove(otherCls);
       el.classList.add(cls);
     }
 
     gated = true;
     ensureIndicator();
-    log("gated", candidates.length);
+    log("gated", { candidates: candidates.length, gated: toGate.length, kept: toKeep.length });
   }
 
   function releaseGate() {
     clearTimeout(releaseTimer);
     releaseTimer = setTimeout(() => {
-      document
-        .querySelectorAll(".cgpt-render-gated-hidden, .cgpt-render-gated-contained")
-        .forEach((el) => {
-          el.classList.remove("cgpt-render-gated-hidden", "cgpt-render-gated-contained");
-        });
+      clearGateClasses();
       gated = false;
       removeIndicator();
       log("released");
@@ -252,7 +267,7 @@
   }
 
   function toggleMode() {
-    CONFIG.mode = CONFIG.mode === "hide" ? "contain" : "hide";
+    CONFIG.mode = CONFIG.mode === "blank" ? "dim" : "blank";
     if (gated) applyGate();
     console.warn(`[cgpt-render-gate] mode=${CONFIG.mode}`);
   }
@@ -262,12 +277,15 @@
     apply: applyGate,
     release: releaseGate,
     toggleMode,
+    clear: clearGateClasses,
     candidates: findGateCandidates,
     stats() {
       return {
         generating: isGenerating(),
         gated,
         candidates: findGateCandidates().length,
+        gatedCount: lastGatedCount,
+        keepNewest: CONFIG.keepNewest,
         mode: CONFIG.mode,
       };
     },
@@ -287,5 +305,5 @@
   setInterval(tick, CONFIG.pollMs);
   setTimeout(tick, 1500);
 
-  console.warn("[cgpt-render-gate] loaded. During generation it hides transcript/tool blocks. Alt+Shift+G toggles hide/contain mode.");
+  console.warn("[cgpt-render-gate] loaded. During generation it blanks older transcript/tool blocks while preserving layout. Alt+Shift+G toggles blank/dim mode.");
 })();
