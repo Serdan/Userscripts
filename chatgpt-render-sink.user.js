@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.7.0
-// @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
+// @version      0.8.0
+// @description  Experimental: let ChatGPT's official frontend send requests, but render heavy response deltas in a lightweight transcript instead of React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -26,11 +26,12 @@
     passControlEventsToReact: true,
     passDoneToReact: true,
     preservePanelUntilNewText: true,
-    showBadge: true,
+    showBadge: false,
     showPanel: true,
     debug: false,
     maxCaptureChars: 500000,
     maxEvents: 2000,
+    maxTurns: 20,
     panelUpdateMs: 120,
     targetUrlPatterns: [
       /\/backend-api\/f\/conversation(?:\?|$|\/)/,
@@ -76,6 +77,11 @@
     lastStableText: "",
     lastJSON: null,
     parsed: [],
+  };
+
+  const transcript = {
+    turns: [],
+    current: null,
   };
 
   const streamState = {
@@ -168,6 +174,49 @@
     }, 250);
   }
 
+  function ensureTurn() {
+    if (transcript.current) return transcript.current;
+    const turn = { id: String(Date.now()), user: "", assistant: "", status: "streaming" };
+    transcript.current = turn;
+    transcript.turns.push(turn);
+    trimTurns();
+    return turn;
+  }
+
+  function trimTurns() {
+    while (transcript.turns.length > CONFIG.maxTurns) transcript.turns.shift();
+  }
+
+  function addUserText(text) {
+    if (!text) return;
+    const last = transcript.turns[transcript.turns.length - 1];
+    if (last && !last.assistant && last.user === text) {
+      transcript.current = last;
+      return;
+    }
+    const turn = { id: String(Date.now()), user: text, assistant: "", status: "streaming" };
+    transcript.current = turn;
+    transcript.turns.push(turn);
+    trimTurns();
+    schedulePanelUpdate();
+  }
+
+  function addAssistantText(text) {
+    if (!text) return;
+    const turn = ensureTurn();
+    turn.assistant = stats.lastText;
+    turn.status = "streaming";
+    schedulePanelUpdate();
+  }
+
+  function finishCurrentTurn() {
+    if (transcript.current) {
+      transcript.current.assistant = stats.lastText || transcript.current.assistant;
+      transcript.current.status = "done";
+    }
+    schedulePanelUpdate();
+  }
+
   function installPanel() {
     if (!CONFIG.showPanel) return;
     if (!page.document || page.document.getElementById(PANEL_ID)) return;
@@ -178,8 +227,8 @@
       "position:fixed",
       "right:12px",
       "bottom:12px",
-      "width:min(760px,calc(100vw - 24px))",
-      "max-height:40vh",
+      "width:min(860px,calc(100vw - 24px))",
+      "height:min(72vh,760px)",
       "z-index:2147483646",
       "display:flex",
       "flex-direction:column",
@@ -196,14 +245,27 @@
     header.style.cssText = "display:flex;gap:8px;align-items:center;padding:6px 8px;border-bottom:1px solid color-mix(in srgb, CanvasText 18%, transparent);";
 
     const title = page.document.createElement("strong");
-    title.textContent = "Render Sink Output";
+    title.textContent = "Render Sink Transcript";
     title.style.cssText = "font-size:12px;margin-right:auto;opacity:.8;";
 
     const copy = page.document.createElement("button");
-    copy.textContent = "Copy";
+    copy.textContent = "Copy latest";
     copy.style.cssText = "font-size:12px;padding:3px 7px;";
     copy.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(stats.lastText || stats.lastStableText || stats.lastCapture || ""); } catch {}
+      const last = transcript.turns[transcript.turns.length - 1];
+      const text = last?.assistant || stats.lastText || stats.lastStableText || stats.lastCapture || "";
+      try { await navigator.clipboard.writeText(text); } catch {}
+    });
+
+    const clear = page.document.createElement("button");
+    clear.textContent = "Clear";
+    clear.style.cssText = "font-size:12px;padding:3px 7px;";
+    clear.addEventListener("click", () => {
+      transcript.turns = [];
+      transcript.current = null;
+      stats.lastText = "";
+      stats.lastStableText = "";
+      updatePanelNow();
     });
 
     const hide = page.document.createElement("button");
@@ -214,19 +276,48 @@
       panel.remove();
     });
 
-    const body = page.document.createElement("pre");
+    const body = page.document.createElement("div");
     body.id = PANEL_ID + "-body";
     body.style.cssText = [
-      "white-space:pre-wrap",
       "overflow:auto",
-      "margin:0",
       "padding:10px",
+      "display:flex",
+      "flex-direction:column",
+      "gap:10px",
+      "min-height:0",
+    ].join(";");
+
+    header.append(title, copy, clear, hide);
+    panel.append(header, body);
+    page.document.documentElement.appendChild(panel);
+  }
+
+  function renderBlock(label, text, className) {
+    const article = page.document.createElement("article");
+    article.className = className;
+    article.style.cssText = [
+      "border:1px solid color-mix(in srgb, CanvasText 15%, transparent)",
+      "border-radius:8px",
+      "padding:8px 10px",
+      "background:" + (className === "user" ? "color-mix(in srgb, CanvasText 6%, Canvas)" : "Canvas"),
+      "contain:layout style paint",
+    ].join(";");
+
+    const heading = page.document.createElement("div");
+    heading.textContent = label;
+    heading.style.cssText = "font:600 11px system-ui,sans-serif;opacity:.65;margin-bottom:4px;";
+
+    const body = page.document.createElement("pre");
+    body.textContent = text || "";
+    body.style.cssText = [
+      "white-space:pre-wrap",
+      "overflow-wrap:anywhere",
+      "margin:0",
       "font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
     ].join(";");
 
-    header.append(title, copy, hide);
-    panel.append(header, body);
-    page.document.documentElement.appendChild(panel);
+    article.append(heading, body);
+    return article;
   }
 
   function updatePanelNow() {
@@ -235,10 +326,29 @@
     try {
       installPanel();
       const body = page.document.getElementById(PANEL_ID + "-body");
-      if (body) {
-        body.textContent = stats.lastText || stats.lastStableText || "(no parsed text yet)";
-        body.scrollTop = body.scrollHeight;
+      if (!body) return;
+
+      body.textContent = "";
+      if (!transcript.turns.length && !stats.lastStableText && !stats.lastText) {
+        const empty = page.document.createElement("div");
+        empty.textContent = "No captured response yet.";
+        empty.style.cssText = "opacity:.65;padding:8px;";
+        body.appendChild(empty);
+      } else {
+        for (const turn of transcript.turns) {
+          const wrap = page.document.createElement("section");
+          wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;";
+          if (turn.user) wrap.appendChild(renderBlock("You", turn.user, "user"));
+          if (turn.assistant) wrap.appendChild(renderBlock(turn.status === "done" ? "Assistant" : "Assistant streaming", turn.assistant, "assistant"));
+          body.appendChild(wrap);
+        }
+
+        if (!transcript.turns.length && (stats.lastText || stats.lastStableText)) {
+          body.appendChild(renderBlock("Assistant", stats.lastText || stats.lastStableText, "assistant"));
+        }
       }
+
+      body.scrollTop = body.scrollHeight;
     } catch {}
   }
 
@@ -304,23 +414,31 @@
       return value.map(extractPatchValueText).filter(Boolean).join("");
     }
 
-    if (typeof value === "string") {
-      return isContentPath(effectivePath) ? value : "";
-    }
-
+    if (typeof value === "string") return isContentPath(effectivePath) ? value : "";
     if (value && typeof value === "object") return extractTextFromObject(value);
     return "";
+  }
+
+  function extractUserText(obj) {
+    const message = obj?.input_message || obj?.message || obj?.v?.message;
+    if (message?.author?.role !== "user") return "";
+    const parts = message.content?.parts;
+    return Array.isArray(parts) ? parts.join("\n") : "";
   }
 
   function extractTextFromObject(obj) {
     if (!obj || typeof obj !== "object") return "";
 
+    const userText = extractUserText(obj);
+    if (userText) {
+      addUserText(userText);
+      return "";
+    }
+
     const patchText = extractPatchValueText(obj);
     if (patchText) return patchText;
 
-    if (typeof obj.v === "string" && streamState.currentContentPath && isContentPath(streamState.currentContentPath)) {
-      return obj.v;
-    }
+    if (typeof obj.v === "string" && streamState.currentContentPath && isContentPath(streamState.currentContentPath)) return obj.v;
 
     const candidates = [
       obj.text,
@@ -359,14 +477,11 @@
     stats.totalTextEvents++;
     stats.currentStreamTextEvents++;
 
-    if (text.length >= stats.lastText.length && text.startsWith(stats.lastText)) {
-      stats.lastText = text;
-    } else {
-      stats.lastText += text;
-    }
+    if (text.length >= stats.lastText.length && text.startsWith(stats.lastText)) stats.lastText = text;
+    else stats.lastText += text;
 
     stats.lastStableText = stats.lastText;
-    schedulePanelUpdate();
+    addAssistantText(text);
   }
 
   function processParsedPayload(kind, data, rawForPreview = "") {
@@ -385,6 +500,9 @@
         } catch {}
       }
     }
+
+    const type = json?.type || "";
+    if (type === "message_stream_complete" || data === "[DONE]") finishCurrentTurn();
 
     storeParsedEntry({
       event: kind,
@@ -575,6 +693,7 @@
   page.cgptRenderSink = {
     config: CONFIG,
     stats,
+    transcript,
     enable() {
       CONFIG.enabled = true;
       updateBadge();
@@ -614,6 +733,8 @@
       stats.lastStableText = "";
       stats.lastJSON = null;
       stats.parsed = [];
+      transcript.turns = [];
+      transcript.current = null;
       stats.bytes = 0;
       stats.events = 0;
       stats.ndjsonRecords = 0;
@@ -653,5 +774,5 @@
     onReady();
   }
 
-  console.warn("[cgpt-render-sink] loaded. Eager transform mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
+  console.warn("[cgpt-render-sink] loaded. Lightweight transcript mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
 })();
