@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.3.0
+// @version      0.4.0
 // @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -30,7 +30,22 @@
     debug: false,
     maxCaptureChars: 500000,
     maxEvents: 2000,
-    targetUrlPattern: /\/backend-api\//,
+    targetUrlPatterns: [
+      /\/backend-api\/f\/conversation(?:\?|$|\/)/,
+      /\/backend-api\/conversation\/[^/]+(?:\?|$|\/)/,
+      /\/backend-api\/responses(?:\?|$|\/)/,
+      /\/backend-api\/codex\//,
+    ],
+    excludedUrlPatterns: [
+      /\/backend-api\/files\//,
+      /\/backend-api\/file\//,
+      /\/backend-api\/conversation\/[^/]+\/textdocs/,
+      /\/backend-api\/aip\//,
+      /\/backend-api\/sentinel\//,
+      /\/backend-api\/settings\//,
+      /\/backend-api\/checkout_/,
+      /\/backend-api\/hermes\//,
+    ],
   };
 
   const stats = {
@@ -40,6 +55,7 @@
     failed: 0,
     bytes: 0,
     events: 0,
+    ndjsonRecords: 0,
     parsedEvents: 0,
     textEvents: 0,
     controlEventsPassed: 0,
@@ -68,12 +84,17 @@
     return "";
   }
 
+  function urlMatches(url, patterns) {
+    return patterns.some((pattern) => pattern.test(url || ""));
+  }
+
   function shouldSink(url, response) {
     if (!CONFIG.enabled) return false;
-    if (!CONFIG.targetUrlPattern.test(url || "")) return false;
+    if (!urlMatches(url, CONFIG.targetUrlPatterns)) return false;
+    if (urlMatches(url, CONFIG.excludedUrlPatterns)) return false;
     if (!response || !response.body) return false;
     const type = response.headers.get("content-type") || "";
-    return type.includes("text/event-stream");
+    return type.includes("text/event-stream") || type.includes("application/x-ndjson") || type.includes("application/jsonl");
   }
 
   function installBadge() {
@@ -218,26 +239,53 @@
     return out;
   }
 
+  function isPatchOperationObject(obj) {
+    return Boolean(
+      obj &&
+      typeof obj === "object" &&
+      typeof obj.o === "string" &&
+      ["add", "append", "patch", "replace", "remove"].includes(obj.o) &&
+      ("p" in obj || "v" in obj)
+    );
+  }
+
+  function extractPatchValueText(obj) {
+    if (!isPatchOperationObject(obj)) return "";
+    const path = Array.isArray(obj.p) ? obj.p.join("/") : String(obj.p || "");
+    const value = obj.v;
+
+    if (typeof value === "string" && /message|content|parts|text|body|output/i.test(path)) {
+      return value;
+    }
+
+    if (value && typeof value === "object") {
+      return extractTextFromObject(value);
+    }
+
+    return "";
+  }
+
   function extractTextFromObject(obj) {
     if (!obj || typeof obj !== "object") return "";
+
+    const patchText = extractPatchValueText(obj);
+    if (patchText) return patchText;
 
     const candidates = [
       obj.text,
       obj.delta,
-      obj.v,
       obj.value,
       obj.message?.content?.parts?.join?.("\n"),
       obj.args?.content,
       obj.args?.text,
       obj.content,
-      obj.o,
     ];
 
     for (const value of candidates) {
       if (typeof value === "string" && value) return value;
     }
 
-    for (const key of ["p", "data", "payload", "message", "item", "delta"]) {
+    for (const key of ["data", "payload", "message", "item", "delta", "v"]) {
       const nested = obj[key];
       if (nested && typeof nested === "object") {
         const found = extractTextFromObject(nested);
@@ -248,53 +296,78 @@
     return "";
   }
 
-  function processSSEEvent(raw) {
-    if (!raw.trim()) return { parsed: null, text: "", passToReact: false };
-    stats.events++;
+  function storeParsedEntry(entry) {
+    stats.parsed.push(entry);
+    if (stats.parsed.length > CONFIG.maxEvents) stats.parsed.shift();
+    stats.parsedEvents++;
+  }
 
-    const parsed = parseSSEEvent(raw);
+  function acceptText(text) {
+    if (!text) return;
+    stats.textEvents++;
+    if (text.length >= stats.lastText.length || text.startsWith(stats.lastText)) {
+      stats.lastText = text;
+    } else {
+      stats.lastText += text;
+    }
+    updatePanel();
+  }
+
+  function processParsedPayload(kind, data, rawForPreview = "") {
     let json = null;
     let text = "";
 
-    if (parsed.data && parsed.data !== "[DONE]") {
+    if (data && data !== "[DONE]") {
       try {
-        json = JSON.parse(parsed.data);
+        json = JSON.parse(data);
         stats.lastJSON = json;
         text = extractTextFromObject(json);
       } catch {
         try {
-          const value = JSON.parse(parsed.data);
-          if (typeof value === "string") text = value;
+          const value = JSON.parse(data);
+          if (typeof value === "string" && kind !== "delta_encoding") text = value;
         } catch {}
       }
     }
 
     const entry = {
-      event: parsed.event,
-      dataPreview: parsed.data.slice(0, 500),
+      event: kind,
+      dataPreview: String(data || rawForPreview).slice(0, 500),
       json,
       text,
     };
+    storeParsedEntry(entry);
+    if (text && kind !== "delta_encoding") acceptText(text);
+    return { json, text, entry };
+  }
 
-    stats.parsed.push(entry);
-    if (stats.parsed.length > CONFIG.maxEvents) stats.parsed.shift();
-    stats.parsedEvents++;
+  function processSSEEvent(raw) {
+    if (!raw.trim()) return { parsed: null, text: "", passToReact: false, raw };
+    stats.events++;
 
-    if (text && parsed.event !== "delta_encoding") {
-      stats.textEvents++;
-      if (text.length >= stats.lastText.length || text.startsWith(stats.lastText)) {
-        stats.lastText = text;
-      } else {
-        stats.lastText += text;
-      }
-      updatePanel();
-    }
+    const parsed = parseSSEEvent(raw);
+    const payload = processParsedPayload(parsed.event, parsed.data, raw);
 
     return {
       parsed,
-      json,
-      text,
-      passToReact: shouldPassEventToReact(parsed, json, text),
+      json: payload.json,
+      text: payload.text,
+      passToReact: shouldPassEventToReact(parsed, payload.json, payload.text),
+      raw,
+    };
+  }
+
+  function processNDJSONLine(raw) {
+    const line = raw.trim();
+    if (!line) return { passToReact: false, raw };
+    stats.ndjsonRecords++;
+    const payload = processParsedPayload("ndjson", line, raw);
+    return {
+      parsed: { event: "ndjson", data: line },
+      json: payload.json,
+      text: payload.text,
+      passToReact: shouldPassEventToReact({ event: "ndjson", data: line }, payload.json, payload.text),
+      raw,
     };
   }
 
@@ -306,7 +379,6 @@
     if (parsed.event === "delta_encoding") return true;
     if (json?.type === "resume_conversation_token") return true;
 
-    // Allow tiny metadata/control frames, but do not pass text-bearing frames.
     if (!text && parsed.data.length < 1200) {
       const type = json?.type || "";
       if (/token|resume|control|meta|status|heartbeat|ping|ack/i.test(type)) return true;
@@ -315,10 +387,11 @@
     return false;
   }
 
-  function makeTransformedResponse(response) {
+  function makeTransformedResponse(response, contentType) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
+    const isEventStream = contentType.includes("text/event-stream");
     let pending = "";
 
     stats.lastCapture = "";
@@ -327,6 +400,7 @@
     stats.parsed = [];
     stats.bytes = 0;
     stats.events = 0;
+    stats.ndjsonRecords = 0;
     stats.parsedEvents = 0;
     stats.textEvents = 0;
     stats.controlEventsPassed = 0;
@@ -345,7 +419,7 @@
                 maybeCaptureText(tail);
                 pending += tail;
               }
-              if (pending.trim()) emitEvent(controller, pending);
+              flushPending(controller, true);
               controller.close();
               stats.transformed++;
               updateBadge();
@@ -358,11 +432,7 @@
             const text = decoder.decode(value, { stream: true });
             maybeCaptureText(text);
             pending += text;
-
-            const events = pending.split("\n\n");
-            pending = events.pop() || "";
-
-            for (const raw of events) emitEvent(controller, raw);
+            flushPending(controller, false);
             updateBadge();
             return;
           }
@@ -379,11 +449,26 @@
       },
     });
 
-    function emitEvent(controller, raw) {
-      const result = processSSEEvent(raw);
+    function flushPending(controller, final) {
+      if (isEventStream) {
+        const events = pending.split("\n\n");
+        pending = final ? "" : (events.pop() || "");
+        for (const raw of events) emitEvent(controller, raw, "sse");
+        if (final && pending.trim()) emitEvent(controller, pending, "sse");
+      } else {
+        const lines = pending.split(/\r?\n/);
+        pending = final ? "" : (lines.pop() || "");
+        for (const raw of lines) emitEvent(controller, raw, "ndjson");
+        if (final && pending.trim()) emitEvent(controller, pending, "ndjson");
+      }
+    }
+
+    function emitEvent(controller, raw, kind) {
+      const result = kind === "sse" ? processSSEEvent(raw) : processNDJSONLine(raw);
       if (result.passToReact) {
         stats.controlEventsPassed++;
-        controller.enqueue(encoder.encode(raw + "\n\n"));
+        const suffix = kind === "sse" ? "\n\n" : "\n";
+        controller.enqueue(encoder.encode(raw + suffix));
       } else {
         stats.eventsSwallowed++;
       }
@@ -402,7 +487,8 @@
     stats.lastUrl = url;
 
     const response = await originalFetch(input, init);
-    stats.lastContentType = response.headers.get("content-type") || "";
+    const contentType = response.headers.get("content-type") || "";
+    stats.lastContentType = contentType;
 
     if (!shouldSink(url, response)) {
       stats.passed++;
@@ -411,7 +497,7 @@
     }
 
     if (CONFIG.transformStreams) {
-      return makeTransformedResponse(response);
+      return makeTransformedResponse(response, contentType);
     }
 
     return response;
@@ -460,6 +546,7 @@
       stats.parsed = [];
       stats.bytes = 0;
       stats.events = 0;
+      stats.ndjsonRecords = 0;
       stats.parsedEvents = 0;
       stats.textEvents = 0;
       stats.controlEventsPassed = 0;
