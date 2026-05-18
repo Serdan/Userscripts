@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.5.0
+// @version      0.6.0
 // @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -25,6 +25,7 @@
     transformStreams: true,
     passControlEventsToReact: true,
     passDoneToReact: true,
+    preservePanelUntilNewText: true,
     showBadge: true,
     showPanel: true,
     debug: false,
@@ -67,12 +68,17 @@
     lastError: "",
     lastCapture: "",
     lastText: "",
+    lastStableText: "",
     lastJSON: null,
     parsed: [],
   };
 
   const streamState = {
     currentContentPath: "",
+    activeText: "",
+    sawAssistantMessage: false,
+    sawContentDelta: false,
+    streamTextEvents: 0,
   };
 
   const originalFetch = page.fetch.bind(page);
@@ -186,7 +192,7 @@
     copy.textContent = "Copy";
     copy.style.cssText = "font-size:12px;padding:3px 7px;";
     copy.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(stats.lastText || stats.lastCapture || ""); } catch {}
+      try { await navigator.clipboard.writeText(stats.lastText || stats.lastStableText || stats.lastCapture || ""); } catch {}
     });
 
     const hide = page.document.createElement("button");
@@ -218,7 +224,7 @@
       installPanel();
       const body = page.document.getElementById(PANEL_ID + "-body");
       if (body) {
-        body.textContent = stats.lastText || "(no parsed text yet)";
+        body.textContent = stats.lastText || stats.lastStableText || "(no parsed text yet)";
         body.scrollTop = body.scrollHeight;
       }
     } catch {}
@@ -256,7 +262,10 @@
 
   function rememberContentPath(path) {
     const normalized = normalizePath(path);
-    if (isContentPath(normalized)) streamState.currentContentPath = normalized;
+    if (isContentPath(normalized)) {
+      streamState.currentContentPath = normalized;
+      streamState.sawContentDelta = true;
+    }
   }
 
   function isPatchOperationObject(obj) {
@@ -293,13 +302,18 @@
     return "";
   }
 
+  function noteAssistantMessage(obj) {
+    const message = obj?.message || obj?.v?.message || obj?.input_message;
+    if (message?.author?.role === "assistant") streamState.sawAssistantMessage = true;
+  }
+
   function extractTextFromObject(obj) {
     if (!obj || typeof obj !== "object") return "";
+    noteAssistantMessage(obj);
 
     const patchText = extractPatchValueText(obj);
     if (patchText) return patchText;
 
-    // ChatGPT delta continuation: after an initial content path, subsequent events may be bare { v: "..." }.
     if (typeof obj.v === "string" && streamState.currentContentPath && isContentPath(streamState.currentContentPath)) {
       return obj.v;
     }
@@ -338,11 +352,13 @@
   function acceptText(text) {
     if (!text) return;
     stats.textEvents++;
+    streamState.streamTextEvents++;
     if (text.length >= stats.lastText.length && text.startsWith(stats.lastText)) {
       stats.lastText = text;
     } else {
       stats.lastText += text;
     }
+    stats.lastStableText = stats.lastText;
     updatePanel();
   }
 
@@ -428,7 +444,6 @@
     let pending = "";
 
     stats.lastCapture = "";
-    stats.lastText = "";
     stats.lastJSON = null;
     stats.parsed = [];
     stats.bytes = 0;
@@ -439,7 +454,16 @@
     stats.controlEventsPassed = 0;
     stats.eventsSwallowed = 0;
     streamState.currentContentPath = "";
-    updatePanel();
+    streamState.activeText = "";
+    streamState.sawAssistantMessage = false;
+    streamState.sawContentDelta = false;
+    streamState.streamTextEvents = 0;
+
+    if (!CONFIG.preservePanelUntilNewText) {
+      stats.lastText = "";
+      updatePanel();
+    }
+
     updateBadge("RenderSink: transforming stream...");
 
     const stream = new ReadableStream({
@@ -456,6 +480,7 @@
               flushPending(controller, true);
               controller.close();
               stats.transformed++;
+              if (streamState.streamTextEvents > 0) stats.lastStableText = stats.lastText;
               updateBadge();
               updatePanel();
               return;
@@ -576,6 +601,7 @@
     clearCapture() {
       stats.lastCapture = "";
       stats.lastText = "";
+      stats.lastStableText = "";
       stats.lastJSON = null;
       stats.parsed = [];
       stats.bytes = 0;
