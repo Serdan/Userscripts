@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.6.1
+// @version      0.7.0
 // @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -31,6 +31,7 @@
     debug: false,
     maxCaptureChars: 500000,
     maxEvents: 2000,
+    panelUpdateMs: 120,
     targetUrlPatterns: [
       /\/backend-api\/f\/conversation(?:\?|$|\/)/,
       /\/backend-api\/conversation\/[^/]+(?:\?|$|\/)/,
@@ -63,6 +64,8 @@
     ndjsonRecords: 0,
     parsedEvents: 0,
     textEvents: 0,
+    totalTextEvents: 0,
+    currentStreamTextEvents: 0,
     controlEventsPassed: 0,
     eventsSwallowed: 0,
     lastUrl: "",
@@ -77,13 +80,11 @@
 
   const streamState = {
     currentContentPath: "",
-    activeText: "",
-    sawAssistantMessage: false,
-    sawContentDelta: false,
-    streamTextEvents: 0,
   };
 
   const originalFetch = page.fetch.bind(page);
+  let panelUpdateTimer = 0;
+  let badgeUpdateTimer = 0;
 
   function log(...args) {
     if (CONFIG.debug) console.log("[cgpt-render-sink]", ...args);
@@ -137,6 +138,16 @@
     page.document.documentElement.appendChild(badge);
   }
 
+  function badgeText() {
+    return "RenderSink " +
+      (CONFIG.enabled ? "on" : "off") +
+      " | tx " + stats.transformed +
+      " | events " + stats.events +
+      " | text " + stats.lastText.length +
+      " | pass " + stats.controlEventsPassed +
+      " | drop " + stats.eventsSwallowed;
+  }
+
   function updateBadge(text) {
     try {
       if (!CONFIG.showBadge) {
@@ -145,18 +156,16 @@
       }
       installBadge();
       const badge = page.document.getElementById(BADGE_ID);
-      if (badge) {
-        badge.textContent = text || (
-          "RenderSink " +
-          (CONFIG.enabled ? "on" : "off") +
-          " | tx " + stats.transformed +
-          " | events " + stats.events +
-          " | text " + stats.lastText.length +
-          " | pass " + stats.controlEventsPassed +
-          " | drop " + stats.eventsSwallowed
-        );
-      }
+      if (badge) badge.textContent = text || badgeText();
     } catch {}
+  }
+
+  function scheduleBadgeUpdate() {
+    if (badgeUpdateTimer) return;
+    badgeUpdateTimer = page.setTimeout(() => {
+      badgeUpdateTimer = 0;
+      updateBadge();
+    }, 250);
   }
 
   function installPanel() {
@@ -220,7 +229,8 @@
     page.document.documentElement.appendChild(panel);
   }
 
-  function updatePanel() {
+  function updatePanelNow() {
+    panelUpdateTimer = 0;
     if (!CONFIG.showPanel) return;
     try {
       installPanel();
@@ -230,6 +240,11 @@
         body.scrollTop = body.scrollHeight;
       }
     } catch {}
+  }
+
+  function schedulePanelUpdate() {
+    if (!CONFIG.showPanel || panelUpdateTimer) return;
+    panelUpdateTimer = page.setTimeout(updatePanelNow, CONFIG.panelUpdateMs);
   }
 
   function maybeCaptureText(chunkText) {
@@ -264,10 +279,7 @@
 
   function rememberContentPath(path) {
     const normalized = normalizePath(path);
-    if (isContentPath(normalized)) {
-      streamState.currentContentPath = normalized;
-      streamState.sawContentDelta = true;
-    }
+    if (isContentPath(normalized)) streamState.currentContentPath = normalized;
   }
 
   function isPatchOperationObject(obj) {
@@ -293,25 +305,15 @@
     }
 
     if (typeof value === "string") {
-      if (isContentPath(effectivePath)) return value;
-      return "";
+      return isContentPath(effectivePath) ? value : "";
     }
 
-    if (value && typeof value === "object") {
-      return extractTextFromObject(value);
-    }
-
+    if (value && typeof value === "object") return extractTextFromObject(value);
     return "";
-  }
-
-  function noteAssistantMessage(obj) {
-    const message = obj?.message || obj?.v?.message || obj?.input_message;
-    if (message?.author?.role === "assistant") streamState.sawAssistantMessage = true;
   }
 
   function extractTextFromObject(obj) {
     if (!obj || typeof obj !== "object") return "";
-    noteAssistantMessage(obj);
 
     const patchText = extractPatchValueText(obj);
     if (patchText) return patchText;
@@ -354,14 +356,17 @@
   function acceptText(text) {
     if (!text) return;
     stats.textEvents++;
-    streamState.streamTextEvents++;
+    stats.totalTextEvents++;
+    stats.currentStreamTextEvents++;
+
     if (text.length >= stats.lastText.length && text.startsWith(stats.lastText)) {
       stats.lastText = text;
     } else {
       stats.lastText += text;
     }
+
     stats.lastStableText = stats.lastText;
-    updatePanel();
+    schedulePanelUpdate();
   }
 
   function processParsedPayload(kind, data, rawForPreview = "") {
@@ -381,15 +386,15 @@
       }
     }
 
-    const entry = {
+    storeParsedEntry({
       event: kind,
       dataPreview: String(data || rawForPreview).slice(0, 500),
       json,
       text,
-    };
-    storeParsedEntry(entry);
+    });
+
     if (text && kind !== "delta_encoding") acceptText(text);
-    return { json, text, entry };
+    return { json, text };
   }
 
   function processSSEEvent(raw) {
@@ -444,6 +449,8 @@
     const encoder = new TextEncoder();
     const isEventStream = contentType.includes("text/event-stream") || contentType.includes("text/plain");
     let pending = "";
+    let controllerRef = null;
+    let closed = false;
 
     stats.lastCapture = "";
     stats.lastJSON = null;
@@ -453,83 +460,87 @@
     stats.ndjsonRecords = 0;
     stats.parsedEvents = 0;
     stats.textEvents = 0;
+    stats.currentStreamTextEvents = 0;
     stats.controlEventsPassed = 0;
     stats.eventsSwallowed = 0;
     streamState.currentContentPath = "";
-    streamState.activeText = "";
-    streamState.sawAssistantMessage = false;
-    streamState.sawContentDelta = false;
-    streamState.streamTextEvents = 0;
 
     if (!CONFIG.preservePanelUntilNewText) {
       stats.lastText = "";
-      updatePanel();
+      updatePanelNow();
     }
 
-    updateBadge("RenderSink: transforming stream...");
+    updateBadge("RenderSink: eagerly pumping stream...");
 
     const stream = new ReadableStream({
-      async pull(controller) {
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) {
-              const tail = decoder.decode();
-              if (tail) {
-                maybeCaptureText(tail);
-                pending += tail;
-              }
-              flushPending(controller, true);
-              controller.close();
-              stats.transformed++;
-              if (streamState.streamTextEvents > 0) stats.lastStableText = stats.lastText;
-              updateBadge();
-              updatePanel();
-              return;
-            }
-
-            if (!value) continue;
-            stats.bytes += value.byteLength || value.length || 0;
-            const text = decoder.decode(value, { stream: true });
-            maybeCaptureText(text);
-            pending += text;
-            flushPending(controller, false);
-            updateBadge();
-            return;
-          }
-        } catch (error) {
-          stats.failed++;
-          stats.lastError = String(error?.message || error);
-          updateBadge("RenderSink: transform failed");
-          log("transform failed", error);
-          controller.error(error);
-        }
+      start(controller) {
+        controllerRef = controller;
+        pump();
       },
       cancel(reason) {
+        closed = true;
         try { reader.cancel(reason); } catch {}
       },
     });
 
-    function flushPending(controller, final) {
-      if (isEventStream) {
-        const events = pending.split("\n\n");
-        pending = final ? "" : (events.pop() || "");
-        for (const raw of events) emitEvent(controller, raw, "sse");
-        if (final && pending.trim()) emitEvent(controller, pending, "sse");
-      } else {
-        const lines = pending.split(/\r?\n/);
-        pending = final ? "" : (lines.pop() || "");
-        for (const raw of lines) emitEvent(controller, raw, "ndjson");
-        if (final && pending.trim()) emitEvent(controller, pending, "ndjson");
+    async function pump() {
+      try {
+        while (!closed) {
+          const { value, done } = await reader.read();
+          if (done) {
+            const tail = decoder.decode();
+            if (tail) {
+              maybeCaptureText(tail);
+              pending += tail;
+            }
+            flushPending(true);
+            closed = true;
+            try { controllerRef.close(); } catch {}
+            stats.transformed++;
+            if (stats.currentStreamTextEvents > 0) stats.lastStableText = stats.lastText;
+            updateBadge();
+            updatePanelNow();
+            return;
+          }
+
+          if (!value) continue;
+          stats.bytes += value.byteLength || value.length || 0;
+          const text = decoder.decode(value, { stream: true });
+          maybeCaptureText(text);
+          pending += text;
+          flushPending(false);
+          scheduleBadgeUpdate();
+        }
+      } catch (error) {
+        closed = true;
+        stats.failed++;
+        stats.lastError = String(error?.message || error);
+        updateBadge("RenderSink: transform failed");
+        log("transform failed", error);
+        try { controllerRef.error(error); } catch {}
       }
     }
 
-    function emitEvent(controller, raw, kind) {
+    function flushPending(final) {
+      if (isEventStream) {
+        const events = pending.split("\n\n");
+        pending = final ? "" : (events.pop() || "");
+        for (const raw of events) emitEvent(raw, "sse");
+        if (final && pending.trim()) emitEvent(pending, "sse");
+      } else {
+        const lines = pending.split(/\r?\n/);
+        pending = final ? "" : (lines.pop() || "");
+        for (const raw of lines) emitEvent(raw, "ndjson");
+        if (final && pending.trim()) emitEvent(pending, "ndjson");
+      }
+    }
+
+    function emitEvent(raw, kind) {
       const result = kind === "sse" ? processSSEEvent(raw) : processNDJSONLine(raw);
-      if (result.passToReact) {
+      if (result.passToReact && !closed) {
         stats.controlEventsPassed++;
         const suffix = kind === "sse" ? "\n\n" : "\n";
-        controller.enqueue(encoder.encode(raw + suffix));
+        try { controllerRef.enqueue(encoder.encode(raw + suffix)); } catch {}
       } else {
         stats.eventsSwallowed++;
       }
@@ -553,14 +564,11 @@
 
     if (!shouldSink(url, response)) {
       stats.passed++;
-      updateBadge();
+      scheduleBadgeUpdate();
       return response;
     }
 
-    if (CONFIG.transformStreams) {
-      return makeTransformedResponse(response, contentType);
-    }
-
+    if (CONFIG.transformStreams) return makeTransformedResponse(response, contentType);
     return response;
   };
 
@@ -586,7 +594,7 @@
     togglePanel() {
       CONFIG.showPanel = !CONFIG.showPanel;
       if (!CONFIG.showPanel) page.document?.getElementById(PANEL_ID)?.remove();
-      else updatePanel();
+      else updatePanelNow();
     },
     lastCapture() {
       return stats.lastCapture;
@@ -611,11 +619,12 @@
       stats.ndjsonRecords = 0;
       stats.parsedEvents = 0;
       stats.textEvents = 0;
+      stats.currentStreamTextEvents = 0;
       stats.controlEventsPassed = 0;
       stats.eventsSwallowed = 0;
       streamState.currentContentPath = "";
       updateBadge();
-      updatePanel();
+      updatePanelNow();
     },
   };
 
@@ -636,7 +645,7 @@
 
   const onReady = () => {
     updateBadge();
-    updatePanel();
+    updatePanelNow();
   };
   if (page.document?.readyState === "loading") {
     page.document.addEventListener("DOMContentLoaded", onReady, { once: true });
@@ -644,5 +653,5 @@
     onReady();
   }
 
-  console.warn("[cgpt-render-sink] loaded. Experimental transform mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
+  console.warn("[cgpt-render-sink] loaded. Eager transform mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
 })();
