@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.8.0
+// @version      0.8.1
 // @description  Experimental: let ChatGPT's official frontend send requests, but render heavy response deltas in a lightweight transcript instead of React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -52,6 +52,8 @@
       /\/ces\/v1\/rgstr(?:\?|$|\/)/,
       /\/ces\/statsc\//,
       /\/ces\/statsc(?:\?|$|\/)/,
+      /\/ces\/v1\/telemetry\//,
+      /\/ces\/v1\/telemetry(?:\?|$|\/)/,
     ],
   };
 
