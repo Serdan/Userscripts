@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.2.0
-// @description  Experimental: let ChatGPT's official frontend send requests, but prevent the heavy response stream from reaching React.
+// @version      0.3.0
+// @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -22,25 +22,28 @@
 
   const CONFIG = {
     enabled: true,
-    consumeRealStream: true,
-    returnSyntheticDone: true,
+    transformStreams: true,
+    passControlEventsToReact: true,
+    passDoneToReact: true,
     showBadge: true,
     showPanel: true,
     debug: false,
     maxCaptureChars: 500000,
     maxEvents: 2000,
-    targetUrlPattern: /\/backend-api\/f\/conversation(?:\?|$|\/)/,
+    targetUrlPattern: /\/backend-api\//,
   };
 
   const stats = {
     fetchCalls: 0,
-    sunk: 0,
+    transformed: 0,
     passed: 0,
     failed: 0,
     bytes: 0,
     events: 0,
     parsedEvents: 0,
     textEvents: 0,
+    controlEventsPassed: 0,
+    eventsSwallowed: 0,
     lastUrl: "",
     lastContentType: "",
     lastError: "",
@@ -111,10 +114,11 @@
         badge.textContent = text || (
           "RenderSink " +
           (CONFIG.enabled ? "on" : "off") +
-          " | sunk " + stats.sunk +
+          " | tx " + stats.transformed +
           " | events " + stats.events +
           " | text " + stats.lastText.length +
-          " | " + Math.round(stats.bytes / 1024) + " KiB"
+          " | pass " + stats.controlEventsPassed +
+          " | drop " + stats.eventsSwallowed
         );
       }
     } catch {}
@@ -193,17 +197,6 @@
     } catch {}
   }
 
-  function makeSyntheticDoneResponse(response) {
-    const body = "data: [DONE]\n\n";
-    const headers = new Headers(response.headers);
-    headers.set("content-type", "text/event-stream; charset=utf-8");
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
-  }
-
   function maybeCaptureText(chunkText) {
     if (!chunkText) return;
     const remaining = CONFIG.maxCaptureChars - stats.lastCapture.length;
@@ -234,18 +227,17 @@
       obj.v,
       obj.value,
       obj.message?.content?.parts?.join?.("\n"),
-      obj.message?.metadata?.message_type === "next" ? obj.message?.content?.parts?.join?.("\n") : "",
       obj.args?.content,
       obj.args?.text,
       obj.content,
+      obj.o,
     ];
 
     for (const value of candidates) {
       if (typeof value === "string" && value) return value;
     }
 
-    // Fallback for nested event payloads. Keep this bounded and conservative.
-    for (const key of ["p", "o", "data", "payload", "message"]) {
+    for (const key of ["p", "data", "payload", "message", "item", "delta"]) {
       const nested = obj[key];
       if (nested && typeof nested === "object") {
         const found = extractTextFromObject(nested);
@@ -257,7 +249,7 @@
   }
 
   function processSSEEvent(raw) {
-    if (!raw.trim()) return;
+    if (!raw.trim()) return { parsed: null, text: "", passToReact: false };
     stats.events++;
 
     const parsed = parseSSEEvent(raw);
@@ -270,7 +262,6 @@
         stats.lastJSON = json;
         text = extractTextFromObject(json);
       } catch {
-        // Some event data is a JSON string or plain marker.
         try {
           const value = JSON.parse(parsed.data);
           if (typeof value === "string") text = value;
@@ -289,9 +280,8 @@
     if (stats.parsed.length > CONFIG.maxEvents) stats.parsed.shift();
     stats.parsedEvents++;
 
-    if (text) {
+    if (text && parsed.event !== "delta_encoding") {
       stats.textEvents++;
-      // Many ChatGPT events carry the full current assistant text, not a delta.
       if (text.length >= stats.lastText.length || text.startsWith(stats.lastText)) {
         stats.lastText = text;
       } else {
@@ -299,11 +289,36 @@
       }
       updatePanel();
     }
+
+    return {
+      parsed,
+      json,
+      text,
+      passToReact: shouldPassEventToReact(parsed, json, text),
+    };
   }
 
-  async function consumeStream(url, response) {
+  function shouldPassEventToReact(parsed, json, text) {
+    if (!parsed) return false;
+    if (parsed.data === "[DONE]") return CONFIG.passDoneToReact;
+    if (!CONFIG.passControlEventsToReact) return false;
+
+    if (parsed.event === "delta_encoding") return true;
+    if (json?.type === "resume_conversation_token") return true;
+
+    // Allow tiny metadata/control frames, but do not pass text-bearing frames.
+    if (!text && parsed.data.length < 1200) {
+      const type = json?.type || "";
+      if (/token|resume|control|meta|status|heartbeat|ping|ack/i.test(type)) return true;
+    }
+
+    return false;
+  }
+
+  function makeTransformedResponse(response) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
     let pending = "";
 
     stats.lastCapture = "";
@@ -314,41 +329,71 @@
     stats.events = 0;
     stats.parsedEvents = 0;
     stats.textEvents = 0;
+    stats.controlEventsPassed = 0;
+    stats.eventsSwallowed = 0;
     updatePanel();
-    updateBadge("RenderSink: consuming real stream...");
+    updateBadge("RenderSink: transforming stream...");
 
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value) continue;
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              const tail = decoder.decode();
+              if (tail) {
+                maybeCaptureText(tail);
+                pending += tail;
+              }
+              if (pending.trim()) emitEvent(controller, pending);
+              controller.close();
+              stats.transformed++;
+              updateBadge();
+              updatePanel();
+              return;
+            }
 
-        stats.bytes += value.byteLength || value.length || 0;
-        const text = decoder.decode(value, { stream: true });
-        maybeCaptureText(text);
+            if (!value) continue;
+            stats.bytes += value.byteLength || value.length || 0;
+            const text = decoder.decode(value, { stream: true });
+            maybeCaptureText(text);
+            pending += text;
 
-        pending += text;
-        const events = pending.split("\n\n");
-        pending = events.pop() || "";
-        for (const raw of events) processSSEEvent(raw);
-        updateBadge();
+            const events = pending.split("\n\n");
+            pending = events.pop() || "";
+
+            for (const raw of events) emitEvent(controller, raw);
+            updateBadge();
+            return;
+          }
+        } catch (error) {
+          stats.failed++;
+          stats.lastError = String(error?.message || error);
+          updateBadge("RenderSink: transform failed");
+          log("transform failed", error);
+          controller.error(error);
+        }
+      },
+      cancel(reason) {
+        try { reader.cancel(reason); } catch {}
+      },
+    });
+
+    function emitEvent(controller, raw) {
+      const result = processSSEEvent(raw);
+      if (result.passToReact) {
+        stats.controlEventsPassed++;
+        controller.enqueue(encoder.encode(raw + "\n\n"));
+      } else {
+        stats.eventsSwallowed++;
       }
-
-      const tail = decoder.decode();
-      maybeCaptureText(tail);
-      pending += tail;
-      if (pending.trim()) processSSEEvent(pending);
-
-      stats.sunk++;
-      updateBadge("RenderSink: stream consumed (" + Math.round(stats.bytes / 1024) + " KiB, " + stats.textEvents + " text events)");
-      updatePanel();
-      log("consumed", { url, bytes: stats.bytes, events: stats.events, textEvents: stats.textEvents });
-    } catch (error) {
-      stats.failed++;
-      stats.lastError = String(error?.message || error);
-      updateBadge("RenderSink: consume failed");
-      log("consume failed", error);
     }
+
+    return new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   }
 
   page.fetch = async function patchedFetch(input, init) {
@@ -365,13 +410,8 @@
       return response;
     }
 
-    if (CONFIG.consumeRealStream) {
-      consumeStream(url, response.clone ? response.clone() : response);
-    }
-
-    if (CONFIG.returnSyntheticDone) {
-      updateBadge("RenderSink: returning synthetic DONE to React");
-      return makeSyntheticDoneResponse(response);
+    if (CONFIG.transformStreams) {
+      return makeTransformedResponse(response);
     }
 
     return response;
@@ -422,6 +462,8 @@
       stats.events = 0;
       stats.parsedEvents = 0;
       stats.textEvents = 0;
+      stats.controlEventsPassed = 0;
+      stats.eventsSwallowed = 0;
       updateBadge();
       updatePanel();
     },
@@ -452,5 +494,5 @@
     onReady();
   }
 
-  console.warn("[cgpt-render-sink] loaded. Experimental. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
+  console.warn("[cgpt-render-sink] loaded. Experimental transform mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
 })();
