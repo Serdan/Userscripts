@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.4.0
+// @version      0.5.0
 // @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -35,6 +35,7 @@
       /\/backend-api\/conversation\/[^/]+(?:\?|$|\/)/,
       /\/backend-api\/responses(?:\?|$|\/)/,
       /\/backend-api\/codex\//,
+      /\/ces\/v1\/m(?:\?|$|\/)/,
     ],
     excludedUrlPatterns: [
       /\/backend-api\/files\//,
@@ -45,6 +46,7 @@
       /\/backend-api\/settings\//,
       /\/backend-api\/checkout_/,
       /\/backend-api\/hermes\//,
+      /\/ces\/v1\/rgstr(?:\?|$|\/)/,
     ],
   };
 
@@ -67,6 +69,10 @@
     lastText: "",
     lastJSON: null,
     parsed: [],
+  };
+
+  const streamState = {
+    currentContentPath: "",
   };
 
   const originalFetch = page.fetch.bind(page);
@@ -94,7 +100,7 @@
     if (urlMatches(url, CONFIG.excludedUrlPatterns)) return false;
     if (!response || !response.body) return false;
     const type = response.headers.get("content-type") || "";
-    return type.includes("text/event-stream") || type.includes("application/x-ndjson") || type.includes("application/jsonl");
+    return type.includes("text/event-stream") || type.includes("application/x-ndjson") || type.includes("application/jsonl") || type.includes("text/plain");
   }
 
   function installBadge() {
@@ -239,6 +245,20 @@
     return out;
   }
 
+  function normalizePath(path) {
+    if (Array.isArray(path)) return "/" + path.join("/");
+    return String(path || "");
+  }
+
+  function isContentPath(path) {
+    return /\/message\/content\/parts(?:\/|$)|\/content\/parts(?:\/|$)|\/text(?:\/|$)|\/body(?:\/|$)|\/output(?:\/|$)/i.test(normalizePath(path));
+  }
+
+  function rememberContentPath(path) {
+    const normalized = normalizePath(path);
+    if (isContentPath(normalized)) streamState.currentContentPath = normalized;
+  }
+
   function isPatchOperationObject(obj) {
     return Boolean(
       obj &&
@@ -251,11 +271,19 @@
 
   function extractPatchValueText(obj) {
     if (!isPatchOperationObject(obj)) return "";
-    const path = Array.isArray(obj.p) ? obj.p.join("/") : String(obj.p || "");
+
+    const path = normalizePath(obj.p || "");
+    if (path) rememberContentPath(path);
+    const effectivePath = path || streamState.currentContentPath;
     const value = obj.v;
 
-    if (typeof value === "string" && /message|content|parts|text|body|output/i.test(path)) {
-      return value;
+    if (Array.isArray(value) && obj.o === "patch") {
+      return value.map(extractPatchValueText).filter(Boolean).join("");
+    }
+
+    if (typeof value === "string") {
+      if (isContentPath(effectivePath)) return value;
+      return "";
     }
 
     if (value && typeof value === "object") {
@@ -270,6 +298,11 @@
 
     const patchText = extractPatchValueText(obj);
     if (patchText) return patchText;
+
+    // ChatGPT delta continuation: after an initial content path, subsequent events may be bare { v: "..." }.
+    if (typeof obj.v === "string" && streamState.currentContentPath && isContentPath(streamState.currentContentPath)) {
+      return obj.v;
+    }
 
     const candidates = [
       obj.text,
@@ -305,7 +338,7 @@
   function acceptText(text) {
     if (!text) return;
     stats.textEvents++;
-    if (text.length >= stats.lastText.length || text.startsWith(stats.lastText)) {
+    if (text.length >= stats.lastText.length && text.startsWith(stats.lastText)) {
       stats.lastText = text;
     } else {
       stats.lastText += text;
@@ -391,7 +424,7 @@
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
-    const isEventStream = contentType.includes("text/event-stream");
+    const isEventStream = contentType.includes("text/event-stream") || contentType.includes("text/plain");
     let pending = "";
 
     stats.lastCapture = "";
@@ -405,6 +438,7 @@
     stats.textEvents = 0;
     stats.controlEventsPassed = 0;
     stats.eventsSwallowed = 0;
+    streamState.currentContentPath = "";
     updatePanel();
     updateBadge("RenderSink: transforming stream...");
 
@@ -551,6 +585,7 @@
       stats.textEvents = 0;
       stats.controlEventsPassed = 0;
       stats.eventsSwallowed = 0;
+      streamState.currentContentPath = "";
       updateBadge();
       updatePanel();
     },
