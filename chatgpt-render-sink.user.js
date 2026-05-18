@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.6.0
+// @version      0.6.1
 // @description  Experimental: let ChatGPT's official frontend send requests, but prevent heavy response deltas from reaching React.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -48,6 +48,8 @@
       /\/backend-api\/checkout_/,
       /\/backend-api\/hermes\//,
       /\/ces\/v1\/rgstr(?:\?|$|\/)/,
+      /\/ces\/statsc\//,
+      /\/ces\/statsc(?:\?|$|\/)/,
     ],
   };
 
