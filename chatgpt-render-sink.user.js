@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.9.0
-// @description  Render plain ChatGPT text deltas in a lightweight transcript while passing structured/interactive stream events to the official UI.
+// @version      0.9.1
+// @description  Render plain ChatGPT text deltas in a lightweight transcript while passing safe structured/control events to the official UI.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -25,7 +25,8 @@
     showPanel: true,
     showBadge: false,
     passDoneToReact: true,
-    passNonTextToReact: true,
+    passStructuredObjectsToReact: true,
+    passUnknownPatchFragmentsToReact: false,
     panelUpdateMs: 120,
     maxTurns: 30,
     maxEvents: 2000,
@@ -66,6 +67,8 @@
     controlEventsPassed: 0,
     eventsSwallowed: 0,
     interactiveEventsPassed: 0,
+    malformedEventsBlocked: 0,
+    patchFragmentsBlocked: 0,
     lastUrl: "",
     lastContentType: "",
     lastError: "",
@@ -304,6 +307,10 @@
     if (isContentPath(normalized)) streamState.currentContentPath = normalized;
   }
 
+  function isPatchObject(json) {
+    return Boolean(json && typeof json === "object" && typeof json.o === "string" && ("p" in json || "v" in json));
+  }
+
   function extractUserText(json) {
     const msg = json?.input_message || json?.message || json?.v?.message;
     if (msg?.author?.role !== "user") return "";
@@ -329,21 +336,28 @@
     return "";
   }
 
-  function isClearlyInteractive(json, raw) {
-    if (!json || typeof json !== "object") return false;
-    const s = raw || JSON.stringify(json).slice(0, 4000);
-    if (/github|connector|oauth|authorization|authorize|approval|permission|consent|button|action|tool_call|tool-call|tool_result|recipient|widget|card/i.test(s)) return true;
-    const msg = json.message || json.v?.message;
-    if (msg) {
-      if (msg.channel && msg.channel !== "final") return true;
-      if (msg.recipient && msg.recipient !== "all") return true;
-      if (msg.content?.content_type && msg.content.content_type !== "text") return true;
-    }
+  function hasStructuredMessage(json) {
+    const msg = json?.message || json?.v?.message || json?.input_message;
+    if (!msg || typeof msg !== "object") return false;
+    const contentType = msg.content?.content_type;
+    if (contentType && contentType !== "text") return true;
+    if (msg.channel && msg.channel !== "final") return true;
+    if (msg.recipient && msg.recipient !== "all") return true;
     return false;
   }
 
-  function recordParsed(kind, data, json, text, passToReact) {
-    stats.parsed.push({ event: kind, dataPreview: String(data || "").slice(0, 500), json, text, passToReact });
+  function hasExplicitInteractiveFields(json) {
+    if (!json || typeof json !== "object") return false;
+    const type = String(json.type || "");
+    if (/tool|connector|oauth|authorization|approval|permission|consent|widget|card|action/i.test(type)) return true;
+    if (hasStructuredMessage(json)) return true;
+    const value = json.v;
+    if (value && typeof value === "object" && hasStructuredMessage(value)) return true;
+    return false;
+  }
+
+  function recordParsed(kind, data, json, text, passToReact, reason) {
+    stats.parsed.push({ event: kind, dataPreview: String(data || "").slice(0, 500), json, text, passToReact, reason });
     if (stats.parsed.length > CONFIG.maxEvents) stats.parsed.shift();
     stats.parsedEvents++;
   }
@@ -357,39 +371,67 @@
     addAssistantText(text);
   }
 
-  function processPayload(kind, data, raw) {
+  function processPayload(kind, data) {
     let json = null;
     let text = "";
-    let passToReact = true;
+    let passToReact = false;
+    let reason = "blocked";
 
     if (data === "[DONE]") {
       finishTurn();
       passToReact = CONFIG.passDoneToReact;
-      recordParsed(kind, data, null, "", passToReact);
+      reason = "done";
+      recordParsed(kind, data, null, "", passToReact, reason);
       return { passToReact };
     }
 
     try { json = data ? JSON.parse(data) : null; } catch {}
-    if (json) {
-      stats.lastJSON = json;
-      const userText = extractUserText(json);
-      if (userText) addUserText(userText);
-      text = extractTextDelta(json);
-      if (text) {
-        passToReact = false;
-        acceptText(text);
+
+    if (!json || typeof json !== "object") {
+      if (kind === "delta_encoding") {
+        passToReact = true;
+        reason = "delta-encoding-control";
       } else {
-        passToReact = CONFIG.passNonTextToReact;
-        if (isClearlyInteractive(json, raw)) {
-          stats.interactiveEventsPassed++;
-          markInteractive();
-        }
+        stats.malformedEventsBlocked++;
+        passToReact = false;
+        reason = "non-object-blocked";
       }
-      const type = json.type || "";
-      if (type === "message_stream_complete") finishTurn();
+      recordParsed(kind, data, json, "", passToReact, reason);
+      return { passToReact };
     }
 
-    recordParsed(kind, data, json, text, passToReact);
+    stats.lastJSON = json;
+
+    const userText = extractUserText(json);
+    if (userText) addUserText(userText);
+
+    text = extractTextDelta(json);
+    if (text) {
+      passToReact = false;
+      reason = "text-delta-sunk";
+      acceptText(text);
+    } else if (hasExplicitInteractiveFields(json)) {
+      passToReact = true;
+      reason = "interactive-structured";
+      stats.interactiveEventsPassed++;
+      markInteractive();
+    } else if (isPatchObject(json)) {
+      passToReact = CONFIG.passUnknownPatchFragmentsToReact;
+      reason = passToReact ? "unknown-patch-passed" : "unknown-patch-blocked";
+      if (!passToReact) stats.patchFragmentsBlocked++;
+    } else if (json.type === "resume_conversation_token") {
+      passToReact = true;
+      reason = "resume-token";
+    } else if (json.type === "message_stream_complete") {
+      finishTurn();
+      passToReact = true;
+      reason = "stream-complete";
+    } else {
+      passToReact = CONFIG.passStructuredObjectsToReact;
+      reason = passToReact ? "structured-object" : "structured-object-blocked";
+    }
+
+    recordParsed(kind, data, json, text, passToReact, reason);
     return { passToReact };
   }
 
@@ -397,14 +439,14 @@
     if (!raw.trim()) return { passToReact: false };
     stats.events++;
     const parsed = parseSSE(raw);
-    return processPayload(parsed.event, parsed.data, raw);
+    return processPayload(parsed.event, parsed.data);
   }
 
   function processLine(raw) {
     const line = raw.trim();
     if (!line) return { passToReact: false };
     stats.events++;
-    return processPayload("ndjson", line, raw);
+    return processPayload("ndjson", line);
   }
 
   function makeTransformedResponse(response, contentType) {
@@ -426,6 +468,8 @@
     stats.controlEventsPassed = 0;
     stats.eventsSwallowed = 0;
     stats.interactiveEventsPassed = 0;
+    stats.malformedEventsBlocked = 0;
+    stats.patchFragmentsBlocked = 0;
     streamState.currentContentPath = "";
 
     const stream = new ReadableStream({
@@ -551,5 +595,5 @@
   if (page.document?.readyState === "loading") page.document.addEventListener("DOMContentLoaded", ready, { once: true });
   else ready();
 
-  console.warn("[cgpt-render-sink] loaded. Conservative text-sink mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
+  console.warn("[cgpt-render-sink] loaded. Safe fragment mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
 })();
