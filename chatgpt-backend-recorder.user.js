@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Backend Recorder
 // @namespace    local.chatgpt.backend-recorder
-// @version      0.1.0
+// @version      0.1.1
 // @description  Records ChatGPT backend request/stream metadata locally so a future lite client can avoid loading the official app.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -23,6 +23,7 @@
   const CONFIG = {
     enabled: true,
     captureBodies: true,
+    storeSensitiveHeaders: false,
     showBadge: true,
     debug: false,
     urlPatterns: [
@@ -32,6 +33,15 @@
       /\/codex\//,
     ],
   };
+
+  const SENSITIVE_HEADER_PATTERNS = [
+    /^authorization$/i,
+    /^cookie$/i,
+    /^x-oai-is$/i,
+    /^openai-sentinel-/i,
+    /^cf-/i,
+    /^sec-/i,
+  ];
 
   const stats = {
     fetchCalls: 0,
@@ -84,15 +94,21 @@
     }
   }
 
+  function isSensitiveHeader(key) {
+    return SENSITIVE_HEADER_PATTERNS.some((pattern) => pattern.test(key));
+  }
+
   function headersToObject(headersLike) {
     const out = {};
 
     try {
       const headers = new Headers(headersLike || {});
       for (const [key, value] of headers.entries()) {
-        const lower = key.toLowerCase();
-        if (lower === "cookie" || lower === "authorization") continue;
-        out[key] = value;
+        if (!CONFIG.storeSensitiveHeaders && isSensitiveHeader(key)) {
+          out[key] = "[redacted]";
+        } else {
+          out[key] = value;
+        }
       }
     } catch {}
 
@@ -113,6 +129,17 @@
     }
 
     return null;
+  }
+
+  function sanitizeRecord(record) {
+    return {
+      ...record,
+      requestHeaders: headersToObject(record.requestHeaders),
+    };
+  }
+
+  function loadSanitizedRecords() {
+    return loadRecords().map(sanitizeRecord);
   }
 
   function installBadge() {
@@ -208,7 +235,8 @@
   page.cgptBackendRecorder = {
     config: CONFIG,
     stats,
-    loadRecords,
+    loadRecords: loadSanitizedRecords,
+    loadRawRecords: loadRecords,
     clear() {
       page.localStorage.removeItem(STORAGE_KEY);
       stats.recorded = 0;
