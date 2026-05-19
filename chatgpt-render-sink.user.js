@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Render Sink
 // @namespace    local.chatgpt.render-sink
-// @version      0.9.2
-// @description  Sink plain ChatGPT text deltas into a lightweight transcript while passing explicit interactive/control events only.
+// @version      0.9.3
+// @description  Sink plain ChatGPT text deltas into a lightweight transcript while passing tool lifecycle/control events to the official UI.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -57,9 +57,9 @@
     fetchCalls: 0, transformed: 0, passed: 0, failed: 0, bytes: 0,
     events: 0, parsedEvents: 0, textEvents: 0, totalTextEvents: 0,
     controlEventsPassed: 0, eventsSwallowed: 0, interactiveEventsPassed: 0,
-    malformedEventsBlocked: 0, patchFragmentsBlocked: 0, structuredObjectsBlocked: 0,
-    lastUrl: "", lastContentType: "", lastError: "", lastCapture: "",
-    lastText: "", lastStableText: "", lastJSON: null, parsed: [],
+    toolLifecycleEventsPassed: 0, malformedEventsBlocked: 0, patchFragmentsBlocked: 0,
+    structuredObjectsBlocked: 0, lastUrl: "", lastContentType: "", lastError: "",
+    lastCapture: "", lastText: "", lastStableText: "", lastJSON: null, parsed: [],
   };
 
   const transcript = { turns: [], current: null };
@@ -117,9 +117,9 @@
     schedulePanel();
   }
 
-  function markInteractive() {
+  function markInteractive(note) {
     const turn = ensureTurn();
-    if (!turn.note) turn.note = "Structured / interactive content passed to the official ChatGPT UI.";
+    if (!turn.note) turn.note = note || "Structured / interactive content passed to the official ChatGPT UI.";
     schedulePanel();
   }
 
@@ -284,10 +284,22 @@
     return false;
   }
 
+  function isToolLifecycleFrame(json) {
+    if (!json || typeof json !== "object") return false;
+    if (json.type === "message_marker") return true;
+    if (json.type === "server_ste_metadata") {
+      const meta = json.metadata || {};
+      return Boolean(meta.tool_invoked || meta.tool_name || meta.turn_use_case === "connectors" || meta.turn_use_case === "tools");
+    }
+    if (json.type === "conversation_detail_metadata") return true;
+    return false;
+  }
+
   function hasExplicitInteractiveFields(json) {
     if (!json || typeof json !== "object") return false;
     const type = String(json.type || "");
     if (/tool|connector|oauth|authorization|approval|permission|consent|widget|card|action/i.test(type)) return true;
+    if (isToolLifecycleFrame(json)) return true;
     if (hasStructuredMessage(json)) return true;
     const value = json.v;
     if (value && typeof value === "object" && hasStructuredMessage(value)) return true;
@@ -329,12 +341,36 @@
     const userText = extractUserText(json);
     if (userText) addUserText(userText);
     text = extractTextDelta(json);
-    if (text) { passToReact = false; reason = "text-delta-sunk"; acceptText(text); }
-    else if (hasExplicitInteractiveFields(json)) { passToReact = true; reason = "interactive-structured"; stats.interactiveEventsPassed++; markInteractive(); }
-    else if (isPatchObject(json)) { passToReact = CONFIG.passUnknownPatchFragmentsToReact; reason = passToReact ? "unknown-patch-passed" : "unknown-patch-blocked"; if (!passToReact) stats.patchFragmentsBlocked++; }
-    else if (json.type === "resume_conversation_token") { passToReact = true; reason = "resume-token"; }
-    else if (json.type === "message_stream_complete") { finishTurn(); passToReact = true; reason = "stream-complete"; }
-    else { passToReact = CONFIG.passStructuredObjectsToReact; reason = passToReact ? "structured-object" : "structured-object-blocked"; if (!passToReact) stats.structuredObjectsBlocked++; }
+    if (text) {
+      passToReact = false;
+      reason = "text-delta-sunk";
+      acceptText(text);
+    } else if (isToolLifecycleFrame(json)) {
+      passToReact = true;
+      reason = "tool-lifecycle";
+      stats.toolLifecycleEventsPassed++;
+      markInteractive("Tool / connector lifecycle metadata passed to the official ChatGPT UI.");
+    } else if (hasExplicitInteractiveFields(json)) {
+      passToReact = true;
+      reason = "interactive-structured";
+      stats.interactiveEventsPassed++;
+      markInteractive();
+    } else if (isPatchObject(json)) {
+      passToReact = CONFIG.passUnknownPatchFragmentsToReact;
+      reason = passToReact ? "unknown-patch-passed" : "unknown-patch-blocked";
+      if (!passToReact) stats.patchFragmentsBlocked++;
+    } else if (json.type === "resume_conversation_token") {
+      passToReact = true;
+      reason = "resume-token";
+    } else if (json.type === "message_stream_complete") {
+      finishTurn();
+      passToReact = true;
+      reason = "stream-complete";
+    } else {
+      passToReact = CONFIG.passStructuredObjectsToReact;
+      reason = passToReact ? "structured-object" : "structured-object-blocked";
+      if (!passToReact) stats.structuredObjectsBlocked++;
+    }
     recordParsed(kind, data, json, text, passToReact, reason);
     return { passToReact };
   }
@@ -348,7 +384,7 @@
     const encoder = new TextEncoder();
     const isEventStream = contentType.includes("text/event-stream") || contentType.includes("text/plain");
     let pending = "", controllerRef = null, closed = false;
-    Object.assign(stats, { lastCapture: "", lastJSON: null, parsed: [], bytes: 0, events: 0, parsedEvents: 0, textEvents: 0, controlEventsPassed: 0, eventsSwallowed: 0, interactiveEventsPassed: 0, malformedEventsBlocked: 0, patchFragmentsBlocked: 0, structuredObjectsBlocked: 0 });
+    Object.assign(stats, { lastCapture: "", lastJSON: null, parsed: [], bytes: 0, events: 0, parsedEvents: 0, textEvents: 0, controlEventsPassed: 0, eventsSwallowed: 0, interactiveEventsPassed: 0, toolLifecycleEventsPassed: 0, malformedEventsBlocked: 0, patchFragmentsBlocked: 0, structuredObjectsBlocked: 0 });
     streamState.currentContentPath = "";
     const stream = new ReadableStream({ start(controller) { controllerRef = controller; pump(); }, cancel(reason) { closed = true; try { reader.cancel(reason); } catch {} } });
     async function pump() {
@@ -418,5 +454,5 @@
   const ready = () => { updateBadge(); updatePanelNow(); };
   if (page.document?.readyState === "loading") page.document.addEventListener("DOMContentLoaded", ready, { once: true });
   else ready();
-  console.warn("[cgpt-render-sink] loaded. Explicit interactive mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
+  console.warn("[cgpt-render-sink] loaded. Tool lifecycle mode. Alt+Shift+S toggles sink; Alt+Shift+V toggles badge; Alt+Shift+P toggles panel.");
 })();
